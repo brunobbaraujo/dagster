@@ -528,8 +528,8 @@ def _get_default_executor_requirements(
         Selector(
             {
                 "multiprocess": MULTI_PROC_CONFIG,
-                "in_process": IN_PROC_CONFIG,
                 "multithread": MULTITHREAD_CONFIG_SCHEMA,
+                "in_process": IN_PROC_CONFIG,
             },
         ),
         default_value={"multiprocess": {}},
