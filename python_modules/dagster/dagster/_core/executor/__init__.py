@@ -3,11 +3,11 @@
 from dagster._core.executor.base import Executor
 from dagster._core.executor.in_process import InProcessExecutor
 from dagster._core.executor.multiprocess import MultiprocessExecutor
-from dagster._core.executor.multithread import MultiThreadExecutor
+from dagster._core.executor.multithread import MultithreadExecutor
 
 __all__ = [
-    'Executor',
-    'InProcessExecutor',
-    'MultiprocessExecutor',
-    'MultiThreadExecutor',
+    "Executor",
+    "InProcessExecutor",
+    "MultiprocessExecutor",
+    "MultithreadExecutor",
 ]

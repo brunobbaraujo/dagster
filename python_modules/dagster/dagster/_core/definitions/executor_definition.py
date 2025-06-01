@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from dagster._core.executor.in_process import InProcessExecutor
     from dagster._core.executor.init import InitExecutorContext
     from dagster._core.executor.multiprocess import MultiprocessExecutor
-    from dagster._core.executor.multithread import MultiThreadExecutor
+    from dagster._core.executor.multithread import MultithreadExecutor
     from dagster._core.instance import DagsterInstance
 
 
@@ -342,8 +342,10 @@ def _core_multiprocess_executor_creation(config: ExecutorConfig) -> "Multiproces
     )
 
 
-def _core_multithread_executor_creation(config: ExecutorConfig) -> "MultiThreadExecutor":
-    return MultiThreadExecutor(
+def _core_multithread_executor_creation(config: ExecutorConfig) -> "MultithreadExecutor":
+    from dagster._core.executor.multithread import MultithreadExecutor
+
+    return MultithreadExecutor(
         max_concurrent=check.opt_int_elem(config, "max_concurrent"),
         tag_concurrency_limits=check.opt_list_elem(config, "tag_concurrency_limits"),
         retries=RetryMode.from_config(check.dict_elem(config, "retries")),  # type: ignore
@@ -436,48 +438,22 @@ def multiprocess_executor(init_context):
 
 
 MULTITHREAD_CONFIG_SCHEMA = {
-    "max_concurrent": {
-        "type": "int",
-        "is_required": False,
-        "description": "The maximum number of threads that can be active at once. (Default: os.cpu_count())",
-    },
-    "retries": {
-        "type": "dict",
-        "is_required": False,
-        "description": "Configuration for retrying step execution when the step fails.",
-    },
-    "tag_concurrency_limits": {
-        "type": "list",
-        "is_required": False,
-        "description": "Configure concurrency limits for steps with specific tags.",
-        "item_type": {
-            "type": "dict",
-            "keys": {
-                "tag": {
-                    "type": "string",
-                    "is_required": True,
-                    "description": "The tag key for which to limit concurrency.",
-                },
-                "value": {
-                    "type": "string",
-                    "is_required": False,
-                    "description": "Only limit concurrency for steps with the tag matching this value.",
-                },
-                "limit": {
-                    "type": "int",
-                    "is_required": True,
-                    "description": "The concurrency limit for steps matching the tag.",
-                },
-            },
-        },
-    },
+    "max_concurrent": Field(
+        Noneable(Int),
+        default_value=None,
+        description=(
+            "The number of processes that may run concurrently. "
+            "By default, this is set to be the return value of `multiprocessing.cpu_count()`."
+        ),
+    ),
+    "tag_concurrency_limits": get_tag_concurrency_limits_config(),
+    "retries": get_retries_config(),
 }
 
 
 @executor(
     name="multithread",
     config_schema=MULTITHREAD_CONFIG_SCHEMA,
-    requirements=lambda _: [ExecutorRequirement.RECONSTRUCTABLE_JOB],
 )
 def multithread_executor(init_context):
     """The multithread executor executes steps in separate threads using a ThreadPoolExecutor.

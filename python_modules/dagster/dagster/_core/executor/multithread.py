@@ -2,10 +2,10 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 import dagster._check as check
 from dagster._core.definitions.metadata import MetadataValue
@@ -23,7 +23,7 @@ from dagster._utils.error import SerializableErrorInfo, serializable_error_info_
 from dagster._utils.timing import format_duration, time_execution_scope
 
 
-class MultiThreadExecutor(Executor):
+class MultithreadExecutor(Executor):
     """Executor that executes steps in parallel using threads.
 
     The multithread executor uses concurrent.futures.ThreadPoolExecutor to execute
@@ -53,7 +53,7 @@ class MultiThreadExecutor(Executor):
 
     def execute_step_in_thread(
         self, step_context, step, instance_concurrency_context
-    ) -> Tuple[str, List[DagsterEvent], Optional[SerializableErrorInfo]]:
+    ) -> tuple[str, Sequence[DagsterEvent], Optional[SerializableErrorInfo]]:
         """Execute a single step in a thread and return results or error."""
         try:
             events = []
@@ -95,9 +95,9 @@ class MultiThreadExecutor(Executor):
         )
 
         # Dict to track futures and their associated step keys
-        futures: Dict[str, Future] = {}
+        futures: Mapping[str, Future] = {}
         # Dict to track errors by step key
-        errors: Dict[str, SerializableErrorInfo] = {}
+        errors: Mapping[str, SerializableErrorInfo] = {}
         # Flag to track if execution is being interrupted
         stopping = False
         # Lock for thread-safe operations
