@@ -5,97 +5,26 @@ import time
 from collections.abc import Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import Any, Optional, cast
 
 from dagster import _check as check
 from dagster._core.definitions.metadata import MetadataValue
-from dagster._core.definitions.reconstruct import ReconstructableJob
-from dagster._core.definitions.repository_definition import RepositoryLoadData
 from dagster._core.errors import DagsterSubprocessError
 from dagster._core.events import DagsterEvent, EngineEventData
 from dagster._core.execution.api import create_execution_plan, execute_plan_iterator
 from dagster._core.execution.context.system import PlanOrchestrationContext
-from dagster._core.execution.context_creation_job import create_context_free_log_manager
 from dagster._core.execution.plan.active import ActiveExecution
 from dagster._core.execution.plan.instance_concurrency_context import InstanceConcurrencyContext
 from dagster._core.execution.plan.objects import StepFailureData
 from dagster._core.execution.plan.plan import ExecutionPlan
-from dagster._core.execution.plan.state import KnownExecutionState
 from dagster._core.execution.retries import RetryMode
 from dagster._core.executor.base import Executor
-from dagster._core.instance import DagsterInstance
-from dagster._utils import start_termination_thread
 from dagster._utils.error import (
     ExceptionInfo,
     SerializableErrorInfo,
     serializable_error_info_from_exc_info,
 )
 from dagster._utils.timing import format_duration, time_execution_scope
-
-if TYPE_CHECKING:
-    from dagster._core.instance.ref import InstanceRef
-    from dagster._core.storage.dagster_run import DagsterRun
-
-
-class StepProcessExecutorChild:
-    def __init__(
-        self,
-        run_config: Mapping[str, object],
-        dagster_run: "DagsterRun",
-        step_key: str,
-        instance_ref: "InstanceRef",
-        term_event: Any,
-        recon_pipeline: ReconstructableJob,
-        retry_mode: RetryMode,
-        known_state: Optional[KnownExecutionState],
-        repository_load_data: Optional[RepositoryLoadData],
-    ):
-        self.run_config = run_config
-        self.dagster_run = dagster_run
-        self.step_key = step_key
-        self.instance_ref = instance_ref
-        self.term_event = term_event
-        self.recon_pipeline = recon_pipeline
-        self.retry_mode = retry_mode
-        self.known_state = known_state
-        self.repository_load_data = repository_load_data
-
-    def execute(self) -> Iterator[DagsterEvent]:
-        recon_job = self.recon_pipeline
-        with DagsterInstance.from_ref(self.instance_ref) as instance:
-            done_event = threading.Event()
-            start_termination_thread(self.term_event, done_event)
-            try:
-                log_manager = create_context_free_log_manager(instance, self.dagster_run)
-
-                yield DagsterEvent.step_worker_started(
-                    log_manager,
-                    self.dagster_run.job_name,
-                    message=f'Executing step "{self.step_key}" in subprocess.',
-                    metadata={
-                        "pid": MetadataValue.text(str(os.getpid())),
-                    },
-                    step_key=self.step_key,
-                )
-                execution_plan = create_execution_plan(
-                    job=recon_job,
-                    run_config=self.run_config,
-                    step_keys_to_execute=[self.step_key],
-                    known_state=self.known_state,
-                    repository_load_data=self.repository_load_data,
-                )
-                yield from execute_plan_iterator(
-                    execution_plan,
-                    recon_job,
-                    self.dagster_run,
-                    run_config=self.run_config,
-                    retry_mode=self.retry_mode.for_inner_plan(),
-                    instance=instance,
-                )
-            finally:
-                # set events to stop the termination thread on exit
-                done_event.set()  # waiting on term_event so set done first
-                self.term_event.set()
 
 
 class MultithreadExecutor(Executor):
@@ -127,26 +56,25 @@ class MultithreadExecutor(Executor):
         return self._retries
 
     def execute_step_in_thread(
-        self, step_context, step_key, active_execution, job_execution_plan
+        self, step_context, step_key, active_execution, job_execution_plan, instance
     ) -> Iterator[DagsterEvent]:
         """Execute a single step in a thread and return results or error."""
-        with DagsterInstance.from_ref(step_context.instance.get_ref()) as instance:
-            step_execution_plan = create_execution_plan(
-                job=step_context.job,
-                run_config=step_context.run_config,
-                step_keys_to_execute=[step_key],
-                known_state=active_execution.get_known_state(),
-                repository_load_data=job_execution_plan.repository_load_data,
-            )
+        step_execution_plan = create_execution_plan(
+            job=step_context.job,
+            run_config=step_context.run_config,
+            step_keys_to_execute=[step_key],
+            known_state=active_execution.get_known_state(),
+            repository_load_data=job_execution_plan.repository_load_data,
+        )
 
-            yield from execute_plan_iterator(
-                step_execution_plan,
-                step_context.job,
-                step_context.dagster_run,
-                run_config=step_context.run_config,
-                retry_mode=self.retries.for_inner_plan(),
-                instance=instance,
-            )
+        yield from execute_plan_iterator(
+            step_execution_plan,
+            step_context.job,
+            step_context.dagster_run,
+            run_config=step_context.run_config,
+            retry_mode=self.retries.for_inner_plan(),
+            instance=instance,
+        )
 
     def execute(
         self, plan_context: PlanOrchestrationContext, execution_plan: ExecutionPlan
@@ -182,7 +110,7 @@ class MultithreadExecutor(Executor):
         # Flag to track if execution is being interrupted
         stopping = False
         # Lock for thread-safe operations
-        execution_lock = threading.RLock()
+        # execution_lock = threading.RLock()
 
         # Use ExitStack to manage multiple context managers
         with ExitStack() as stack:
@@ -222,7 +150,7 @@ class MultithreadExecutor(Executor):
                     # Submit new steps if not stopping
                     if not stopping:
                         # Get steps ready for execution
-                        with execution_lock:
+                        if True:
                             steps_to_execute = active_execution.get_steps_to_execute(
                                 limit=(self._max_concurrent - len(futures))
                             )
@@ -243,6 +171,7 @@ class MultithreadExecutor(Executor):
                                     step_key,
                                     active_execution,
                                     execution_plan,
+                                    step_context.instance,
                                 )
                                 futures[step_key] = future
 
