@@ -454,6 +454,7 @@ MULTITHREAD_CONFIG_SCHEMA = {
 @executor(
     name="multithread",
     config_schema=MULTITHREAD_CONFIG_SCHEMA,
+    requirements=multiple_process_executor_requirements(),
 )
 def multithread_executor(init_context):
     """The multithread executor executes steps in separate threads using a ThreadPoolExecutor.
@@ -519,7 +520,7 @@ def _check_non_ephemeral_instance(instance: "DagsterInstance") -> None:
 def _get_default_executor_requirements(
     executor_config: ExecutorConfig,
 ) -> Sequence[ExecutorRequirement]:
-    return multiple_process_executor_requirements() if "multiprocess" in executor_config else []
+    return [] if "in_process" in executor_config else multiple_process_executor_requirements()
 
 
 @executor(
