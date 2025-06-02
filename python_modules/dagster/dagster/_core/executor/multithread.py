@@ -2,7 +2,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from typing import Any, Optional, cast
@@ -57,7 +57,7 @@ class MultithreadExecutor(Executor):
 
     def execute_step_in_thread(
         self, step_context, step_key, active_execution, job_execution_plan, instance
-    ) -> Iterator[DagsterEvent]:
+    ) -> Sequence[DagsterEvent]:
         """Execute a single step in a thread and return results or error."""
         step_execution_plan = create_execution_plan(
             job=step_context.job,
@@ -67,7 +67,7 @@ class MultithreadExecutor(Executor):
             repository_load_data=job_execution_plan.repository_load_data,
         )
 
-        yield from execute_plan_iterator(
+        iterator = execute_plan_iterator(
             step_execution_plan,
             step_context.job,
             step_context.dagster_run,
@@ -75,6 +75,13 @@ class MultithreadExecutor(Executor):
             retry_mode=self.retries.for_inner_plan(),
             instance=instance,
         )
+
+        if iterator is None:
+            return []
+
+        # Execute the step and return the events
+        events = [event for event in iterator]
+        return events
 
     def execute(
         self, plan_context: PlanOrchestrationContext, execution_plan: ExecutionPlan
@@ -145,43 +152,38 @@ class MultithreadExecutor(Executor):
                             EngineEventData.interrupted(list(futures.keys())),
                         )
                         stopping = True
+                        thread_pool.shutdown(wait=False, cancel_futures=True)
                         active_execution.mark_interrupted()
 
                     # Submit new steps if not stopping
                     if not stopping:
                         # Get steps ready for execution
-                        if True:
-                            steps_to_execute = active_execution.get_steps_to_execute(
-                                limit=(self._max_concurrent - len(futures))
+                        steps_to_execute = active_execution.get_steps_to_execute(
+                            limit=(self._max_concurrent - len(futures))
+                        )
+
+                        yield from active_execution.concurrency_event_iterator(plan_context)
+
+                        # Submit new steps to thread pool
+                        for step in steps_to_execute:
+                            step_key = step.key
+                            step_context = plan_context.for_step(step)
+
+                            future = thread_pool.submit(
+                                self.execute_step_in_thread,
+                                step_context,
+                                step_key,
+                                active_execution,
+                                execution_plan,
+                                step_context.instance,
                             )
+                            futures[step_key] = future
 
-                            yield from active_execution.concurrency_event_iterator(plan_context)
-
-                            if not steps_to_execute:
-                                break
-
-                            # Submit new steps to thread pool
-                            for step in steps_to_execute:
-                                step_key = step.key
-                                step_context = plan_context.for_step(step)
-
-                                future = thread_pool.submit(
-                                    self.execute_step_in_thread,
-                                    step_context,
-                                    step_key,
-                                    active_execution,
-                                    execution_plan,
-                                    step_context.instance,
-                                )
-                                futures[step_key] = future
-
-                                yield DagsterEvent.engine_event(
-                                    step_context,
-                                    "Starting step in thread",
-                                    EngineEventData.in_process(os.getpid()),
-                                )
-
-                        # Process any concurrency-related events
+                            yield DagsterEvent.engine_event(
+                                step_context,
+                                "Starting step in thread",
+                                EngineEventData.in_process(os.getpid()),
+                            )
 
                     # Process completed futures (both success and error cases)
                     completed_steps = []
