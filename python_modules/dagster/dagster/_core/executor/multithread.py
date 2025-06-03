@@ -20,7 +20,6 @@ from dagster._core.execution.plan.plan import ExecutionPlan
 from dagster._core.execution.retries import RetryMode
 from dagster._core.executor.base import Executor
 from dagster._core.instance import DagsterInstance
-from dagster._utils import start_termination_thread
 from dagster._utils.error import SerializableErrorInfo, serializable_error_info_from_exc_info
 from dagster._utils.timing import format_duration, time_execution_scope
 
@@ -94,8 +93,6 @@ class MultithreadExecutor(Executor):
         instance: DagsterInstance,
     ) -> Iterator[DagsterEvent]:
         """Execute a single step in a thread and return results or error."""
-        done_event = threading.Event()
-        start_termination_thread(term_event, done_event)
         try:
             step_execution_plan = create_execution_plan(
                 job=step_context.job,
@@ -118,7 +115,6 @@ class MultithreadExecutor(Executor):
 
         finally:
             # set events to stop the termination thread on exit
-            done_event.set()  # waiting on term_event so set done first
             term_event.set()
 
     def execute(
