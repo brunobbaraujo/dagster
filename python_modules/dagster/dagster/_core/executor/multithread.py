@@ -137,7 +137,6 @@ class MultithreadExecutor(Executor):
         check.inst_param(execution_plan, "execution_plan", ExecutionPlan)
 
         step_keys_to_execute = execution_plan.step_keys_to_execute
-        job = plan_context.reconstructable_job
 
         # Announce start of execution
         yield DagsterEvent.engine_event(
