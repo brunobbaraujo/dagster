@@ -73,6 +73,13 @@ class MultithreadExecutor(Executor):
                 instance=instance,
             ):
                 if term_event.is_set():
+                    event_queue.put(
+                        DagsterEvent.engine_event(
+                            step_context,
+                            "Step execution terminated",
+                            EngineEventData.interrupted(step_key),
+                        )
+                    )
                     return
                 event_queue.put(step_event)
         except (
