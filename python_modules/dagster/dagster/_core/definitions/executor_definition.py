@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from dagster._core.executor.in_process import InProcessExecutor
     from dagster._core.executor.init import InitExecutorContext
     from dagster._core.executor.multiprocess import MultiprocessExecutor
+    from dagster._core.executor.multithread import MultithreadExecutor
     from dagster._core.instance import DagsterInstance
 
 
@@ -341,6 +342,16 @@ def _core_multiprocess_executor_creation(config: ExecutorConfig) -> "Multiproces
     )
 
 
+def _core_multithread_executor_creation(config: ExecutorConfig) -> "MultithreadExecutor":
+    from dagster._core.executor.multithread import MultithreadExecutor
+
+    return MultithreadExecutor(
+        max_concurrent=check.opt_int_elem(config, "max_concurrent"),
+        tag_concurrency_limits=check.opt_list_elem(config, "tag_concurrency_limits"),
+        retries=RetryMode.from_config(check.dict_elem(config, "retries")),  # type: ignore
+    )
+
+
 MULTI_PROC_CONFIG = Field(
     {
         "max_concurrent": Field(
@@ -426,6 +437,48 @@ def multiprocess_executor(init_context):
     return _core_multiprocess_executor_creation(init_context.executor_config)
 
 
+MULTITHREAD_CONFIG_SCHEMA = {
+    "max_concurrent": Field(
+        Noneable(Int),
+        default_value=None,
+        description=(
+            "The number of processes that may run concurrently. "
+            "By default, this is set to be the return value of `multiprocessing.cpu_count()`."
+        ),
+    ),
+    "tag_concurrency_limits": get_tag_concurrency_limits_config(),
+    "retries": get_retries_config(),
+}
+
+
+@executor(
+    name="multithread",
+    config_schema=MULTITHREAD_CONFIG_SCHEMA,
+)
+def multithread_executor(init_context):
+    """The multithread executor executes steps in separate threads using a ThreadPoolExecutor.
+
+    This executor provides parallel execution through threads rather than processes.
+    To configure the multithread executor, include a fragment such as the following in your run
+    config:
+
+    .. code-block:: yaml
+
+        execution:
+          config:
+            multithread:
+              max_concurrent: 8
+
+    The ``max_concurrent`` arg is optional and tells the execution engine how many threads may run
+    concurrently. By default, this is the return value of os.cpu_count().
+
+    Execution priority can be configured using the ``dagster/priority`` tag via op metadata,
+    where the higher the number the higher the priority. 0 is the default and both positive
+    and negative numbers can be used.
+    """
+    return _core_multithread_executor_creation(init_context.executor_config)
+
+
 def check_cross_process_constraints(init_context: "InitExecutorContext") -> None:
     from dagster._core.executor.init import InitExecutorContext
 
@@ -473,7 +526,11 @@ def _get_default_executor_requirements(
     name="multi_or_in_process_executor",
     config_schema=Field(
         Selector(
-            {"multiprocess": MULTI_PROC_CONFIG, "in_process": IN_PROC_CONFIG},
+            {
+                "multiprocess": MULTI_PROC_CONFIG,
+                "multithread": MULTITHREAD_CONFIG_SCHEMA,
+                "in_process": IN_PROC_CONFIG,
+            },
         ),
         default_value={"multiprocess": {}},
     ),
@@ -522,6 +579,10 @@ def multi_or_in_process_executor(init_context: "InitExecutorContext") -> "Execut
     if "multiprocess" in init_context.executor_config:
         return _core_multiprocess_executor_creation(
             check.dict_elem(init_context.executor_config, "multiprocess")
+        )
+    elif "multithread" in init_context.executor_config:
+        return _core_multithread_executor_creation(
+            check.dict_elem(init_context.executor_config, "multithread")
         )
     else:
         return _core_in_process_executor_creation(

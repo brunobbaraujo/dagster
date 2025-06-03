@@ -38,6 +38,7 @@ from dagster._core.definitions.executor_definition import (
     multi_or_in_process_executor as multi_or_in_process_executor,
     multiple_process_executor_requirements as multiple_process_executor_requirements,
     multiprocess_executor as multiprocess_executor,
+    multithread_executor as multithread_executor,
 )
 from dagster._core.definitions.hook_definition import HookDefinition as HookDefinition
 from dagster._core.definitions.input import (
