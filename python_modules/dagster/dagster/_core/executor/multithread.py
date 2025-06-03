@@ -2,28 +2,26 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
-from typing import Any, Optional, cast
+from queue import Queue
+from typing import Any, Optional
 
 from dagster import _check as check
 from dagster._core.definitions.metadata import MetadataValue
-from dagster._core.errors import DagsterSubprocessError
+from dagster._core.errors import DagsterExecutionInterruptedError, DagsterSubprocessError
 from dagster._core.events import DagsterEvent, EngineEventData
 from dagster._core.execution.api import create_execution_plan, execute_plan_iterator
-from dagster._core.execution.context.system import PlanOrchestrationContext
+from dagster._core.execution.context.system import IStepContext, PlanOrchestrationContext
 from dagster._core.execution.plan.active import ActiveExecution
 from dagster._core.execution.plan.instance_concurrency_context import InstanceConcurrencyContext
-from dagster._core.execution.plan.objects import StepFailureData
 from dagster._core.execution.plan.plan import ExecutionPlan
 from dagster._core.execution.retries import RetryMode
 from dagster._core.executor.base import Executor
-from dagster._utils.error import (
-    ExceptionInfo,
-    SerializableErrorInfo,
-    serializable_error_info_from_exc_info,
-)
+from dagster._core.instance import DagsterInstance
+from dagster._utils import start_termination_thread
+from dagster._utils.error import SerializableErrorInfo, serializable_error_info_from_exc_info
 from dagster._utils.timing import format_duration, time_execution_scope
 
 
@@ -55,33 +53,73 @@ class MultithreadExecutor(Executor):
     def retries(self) -> RetryMode:
         return self._retries
 
+    def safe_execute_step_with_event_queue(
+        self,
+        event_queue: Queue[DagsterEvent],
+        step_context: IStepContext,
+        step_key: str,
+        term_event: threading.Event,
+        active_execution: ActiveExecution,
+        job_execution_plan: ExecutionPlan,
+        instance: DagsterInstance,
+    ) -> None:
+        """Execute a step with interrupts captured."""
+        try:
+            for step_event in self.execute_step_in_thread(
+                step_context=step_context,
+                step_key=step_key,
+                term_event=term_event,
+                active_execution=active_execution,
+                job_execution_plan=job_execution_plan,
+                instance=instance,
+            ):
+                if term_event.is_set():
+                    return
+                event_queue.put(step_event)
+        except (
+            Exception,
+            KeyboardInterrupt,
+            DagsterExecutionInterruptedError,
+        ) as err:
+            term_event.set()
+            raise err
+
     def execute_step_in_thread(
-        self, step_context, step_key, active_execution, job_execution_plan, instance
-    ) -> Sequence[DagsterEvent]:
+        self,
+        step_context: IStepContext,
+        step_key: str,
+        term_event: threading.Event,
+        active_execution: ActiveExecution,
+        job_execution_plan: ExecutionPlan,
+        instance: DagsterInstance,
+    ) -> Iterator[DagsterEvent]:
         """Execute a single step in a thread and return results or error."""
-        step_execution_plan = create_execution_plan(
-            job=step_context.job,
-            run_config=step_context.run_config,
-            step_keys_to_execute=[step_key],
-            known_state=active_execution.get_known_state(),
-            repository_load_data=job_execution_plan.repository_load_data,
-        )
+        done_event = threading.Event()
+        start_termination_thread(term_event, done_event)
+        try:
+            step_execution_plan = create_execution_plan(
+                job=step_context.job,
+                run_config=step_context.run_config,
+                step_keys_to_execute=[step_key],
+                known_state=active_execution.get_known_state(),
+                repository_load_data=job_execution_plan.repository_load_data,
+            )
 
-        iterator = execute_plan_iterator(
-            step_execution_plan,
-            step_context.job,
-            step_context.dagster_run,
-            run_config=step_context.run_config,
-            retry_mode=self.retries.for_inner_plan(),
-            instance=instance,
-        )
+            iterator = execute_plan_iterator(
+                step_execution_plan,
+                step_context.job,
+                step_context.dagster_run,
+                run_config=step_context.run_config,
+                retry_mode=self.retries.for_inner_plan(),
+                instance=instance,
+            )
 
-        if iterator is None:
-            return []
+            yield from iterator
 
-        # Execute the step and return the events
-        events = [event for event in iterator]
-        return events
+        finally:
+            # set events to stop the termination thread on exit
+            done_event.set()  # waiting on term_event so set done first
+            term_event.set()
 
     def execute(
         self, plan_context: PlanOrchestrationContext, execution_plan: ExecutionPlan
@@ -116,8 +154,10 @@ class MultithreadExecutor(Executor):
         errors: Mapping[str, SerializableErrorInfo] = {}
         # Flag to track if execution is being interrupted
         stopping = False
-        # Lock for thread-safe operations
-        # execution_lock = threading.RLock()
+        # Termination event to signal threads to stop
+        term_events: Mapping[str, threading.Event] = {}
+        # Create event queue for child process communication
+        event_queue = Queue()
 
         # Use ExitStack to manage multiple context managers
         with ExitStack() as stack:
@@ -153,6 +193,11 @@ class MultithreadExecutor(Executor):
                         )
                         stopping = True
                         thread_pool.shutdown(wait=False, cancel_futures=True)
+                        for key, term_event in term_events.items():
+                            if key in futures:
+                                if futures[key].running():
+                                    term_event.set()
+                                del futures[key]
                         active_execution.mark_interrupted()
 
                     # Submit new steps if not stopping
@@ -167,12 +212,15 @@ class MultithreadExecutor(Executor):
                         # Submit new steps to thread pool
                         for step in steps_to_execute:
                             step_key = step.key
+                            term_events[step_key] = threading.Event()
                             step_context = plan_context.for_step(step)
 
                             future = thread_pool.submit(
-                                self.execute_step_in_thread,
+                                self.safe_execute_step_with_event_queue,
+                                event_queue,
                                 step_context,
                                 step_key,
+                                term_events[step_key],
                                 active_execution,
                                 execution_plan,
                                 step_context.instance,
@@ -186,74 +234,31 @@ class MultithreadExecutor(Executor):
                             )
 
                     # Process completed futures (both success and error cases)
-                    completed_steps = []
-                    for step_key, future in list(futures.items()):
-                        if not future.done():
-                            continue
+                    completed_steps = set()
 
+                    # Check which futures are done
+                    for step_key, future in futures.items():
+                        if future.done():
+                            completed_steps.add(step_key)
+
+                    # Handle events
+                    def __safe_queue_get_nowait() -> Optional[DagsterEvent]:
+                        """Safely get events from the queue without blocking."""
                         try:
-                            events = future.result()
-                            error: ExceptionInfo = cast("ExceptionInfo", future.exception())
-                            completed_steps.append(step_key)
-
-                            if error:
-                                # Handle step failure
-                                step_context = plan_context.for_step(
-                                    active_execution.get_step_by_key(step_key)
-                                )
-                                serializable_error = serializable_error_info_from_exc_info(error)
-                                yield DagsterEvent.engine_event(
-                                    step_context,
-                                    "Step failed in thread execution",
-                                    EngineEventData.engine_error(serializable_error),
-                                )
-
-                                # Generate failure or retry event
-                                failure_or_retry_event = (
-                                    self.get_failure_or_retry_event_after_crash(
-                                        step_context,
-                                        serializable_error,
-                                        active_execution.get_known_state(),
-                                    )
-                                )
-                                yield failure_or_retry_event
-                                active_execution.handle_event(failure_or_retry_event)
-
-                                errors[step_key] = serializable_error
-                            else:
-                                # Process step success events
-                                for event in events:
-                                    yield event
-                                    active_execution.handle_event(event)
-
+                            return event_queue.get_nowait()
                         except Exception:
-                            # Handle unexpected failures in thread execution
-                            error_info = serializable_error_info_from_exc_info(sys.exc_info())
-                            step_context = plan_context.for_step(
-                                active_execution.get_step_by_key(step_key)
-                            )
-                            yield DagsterEvent.engine_event(
-                                step_context,
-                                "Unexpected error in thread execution",
-                                EngineEventData.engine_error(error_info),
-                            )
-                            failure_event = DagsterEvent.step_failure_event(
-                                step_context=step_context,
-                                step_failure_data=StepFailureData(
-                                    error=error_info, user_failure_data=None
-                                ),
-                            )
-                            yield failure_event
-                            active_execution.handle_event(failure_event)
-                            errors[step_key] = error_info
+                            return None
 
-                        finally:
-                            # Clean up completed step
-                            active_execution.verify_complete(plan_context, step_key)
+                    for event in iter(__safe_queue_get_nowait, None):
+                        if event is not None:
+                            yield event
+                            active_execution.handle_event(event)
 
                     # Remove completed futures
                     for step_key in completed_steps:
+                        active_execution.verify_complete(plan_context, step_key)
                         del futures[step_key]
+                        del term_events[step_key]
 
                     # Process skipped and abandoned steps
                     yield from active_execution.plan_events_iterator(plan_context)
@@ -262,7 +267,7 @@ class MultithreadExecutor(Executor):
                     if not completed_steps and futures:
                         time.sleep(0.01)
 
-            except Exception:
+            except Exception as exc:
                 # Handle errors in the main execution loop
                 if not stopping and futures:
                     error_info = serializable_error_info_from_exc_info(sys.exc_info())
@@ -276,8 +281,13 @@ class MultithreadExecutor(Executor):
                             error=error_info,
                         ),
                     )
+                for key, term_event in term_events.items():
+                    if key in futures:
+                        if futures[key].running():
+                            term_event.set()
+                        del futures[key]
 
-                raise
+                raise exc
 
             # Handle any errors from execution
             if errors and any(
